@@ -1,0 +1,400 @@
+---
+title: "Análisis Espacial de Amenidades de Salud en parroquias de Ecuador"
+author: "Katherine Maldonado"
+date: "`r Sys.Date()`"
+format: docx
+editor: visual
+---
+
+## Parte 1: Identificación y Reflexión sobre las Amenidades de Salud
+
+#### Obtener los datos de hospitales de OSM
+
+Para obtener los datos de restaurantes, se utiliza osmdata. Se define la zona de interés y se especifica que se desean puntos de interés con la etiqueta "amenity=hospital". Los datos se descargan y se almacenan como un objeto sf.
+
+```{r, echo=FALSE,message=FALSE}
+#Librerías
+library(osmdata)
+library(sf)
+library(tidyverse)
+library(readxl)
+library(spdep)
+library(lattice) 
+
+# Definir la zona de interés
+bbox <- getbb("Quito", "Ecuador")
+# Obtener datos de hospitales desde OSM
+query <- opq(bbox) %>% add_osm_feature(key="amenity", value="hospital") %>% 
+  osmdata_sf()
+# Extraer puntos de hospitales
+puntos <- query$osm_points
+  
+```
+
+#### Cargar y filtrar los datos de sectores censales
+
+Se cargan las capas de la geodatabase y se selecciona la de zonas censales. Se filtran los datos para escoger solo los sectores censales que interesan, utilizando st_layers para listar las capas y st_read para leer la capa específica.
+
+```{r, echo=FALSE,message=FALSE}
+# Ver las capas disponibles en la geodatabase
+st_layers("./data/GEODATABASE_NACIONAL_2021/GEODATABASE_NACIONAL_2021.gdb/")
+# Cargar la capa "zon_a" que contiene los sectores censales
+zonas <- st_read("./data/GEODATABASE_NACIONAL_2021/GEODATABASE_NACIONAL_2021.gdb/", layer="zon_a")
+# Filtrar por la provincia de interés 
+zonas <- zonas %>% filter(str_detect(zon,"^17"))
+```
+
+#### Mapa de los hospitales
+
+```{r, echo=FALSE, fig.height=6, fig.dpi=300}
+#Gráfica de distribución de hospitales
+ggplot() +
+  geom_sf(data=zonas) +
+  geom_sf(data=puntos)+
+  labs(
+    title = "Fig. Distribución de hospitales en el Distrito Metropolitano de Quito",
+    subtitle = "Fuente:OpenStreetMaps"
+  )+
+  theme_minimal()
+```
+
+#### Extraer información de la población del Ecuador
+
+```{r, echo=FALSE, message=FALSE}
+#Extracción de información
+excel_sheets("./data/01_2022_CPV_Estructura_poblacional.xlsx")
+poblacion <- read_excel("./data/01_2022_CPV_Estructura_poblacional.xlsx", sheet="1.2", range="B10:F1299")
+#Renombrar variables
+names(poblacion) <- c("provincia", "canton", "parroquia", "total_nacional", "hombres", "mujeres")
+```
+
+#### Limpieza de la información extraída
+
+```{r, echo=FALSE, message=FALSE}
+#Limpiamos la data de los resultados del censo (Eliminación de Totales y Nacional y Mayúsculas)
+poblacion %>% filter(!is.na(provincia), str_detect(parroquia, "^Total|Nacional", negate=TRUE))
+poblacion <- poblacion %>% 
+  mutate(across(c(provincia, canton,parroquia), str_to_upper))
+```
+
+#### Extracción de códigos para el cruce de información
+
+```{r, echo=FALSE, message=FALSE}
+#Extracción de información
+dpa <- read_excel("./data/CODIFICACIÓN_2024.xlsx", sheet = "CODIGOS")
+```
+
+### Parte 2: Unión de polígonos de zonas censales a nivel de parroquias
+
+```{r, echo=FALSE, message=FALSE}
+#Unión de los datos de población con dpa
+poblacion <- poblacion %>% 
+  left_join(dpa, by=c("provincia"="DPA_DESPRO",
+                      "canton"="DPA_DESCAN",
+                      "parroquia"="DPA_DESPAR"))
+```
+
+#### Unión de los poligonos a nivel de parroquia por que estan a nivel de zona censal
+
+```{r, echo=FALSE, message=FALSE}
+zonas <- zonas %>% 
+  mutate(DPA_PARROQ=str_sub(zon, 1,6))
+
+parroquias <- zonas %>% 
+  group_by(DPA_PARROQ) %>% 
+  summarise(Shape=st_union(Shape))
+```
+
+#### Unión de los datos de población
+
+```{r, echo=FALSE, message=FALSE}
+parroquias <- parroquias %>% 
+  left_join(poblacion)
+```
+
+#### Mapas de calor
+
+```{r, echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+parroquias %>% 
+  ggplot()+
+  geom_sf(aes(fill=log(total_nacional)))+
+  geom_sf(data=puntos)+
+  scale_fill_gradient(low = "#ebeefb", high = "#0a1f76")+
+  labs(title="Figura 2. Densidad poblacional de la provincia de Pichincha",
+       caption = "Fuente:INEC"
+       )
+```
+
+### Parte 3: Cálculo del número total de amenidades
+
+#### Contar el número de hospitales en cada sector censal
+
+Se transforman las coordenadas de los puntos de hospitales para que coincidan con el sistema de referencia de las zonas censales. Luego, se realiza una unión espacial usando st_join para contar los hospitales dentro de cada sector censal y se agrega esta información a los datos de sectores censales.
+
+```{r, echo=FALSE, message=FALSE}
+# Transformación de las coordenadas de los hospitales al mismo CRS que zonas
+puntos <- st_transform(x=puntos, crs=st_crs(parroquias))
+# Unión espacial para contar los hospitales dentro de cada sector censal
+parroquias_puntos <- st_join(x=puntos, y=parroquias, join=st_within)
+# Conteo del número de hospitales en cada sector censal
+parroquias_puntos <- parroquias_puntos %>%  count(DPA_PARROQ, name="hospitales") %>% as_tibble()
+# Unión de los datos parroquias y parroquias_puntos  
+parroquias <- parroquias %>% 
+  left_join(parroquias_puntos)
+#Reemplazo de na con 0
+parroquias <- parroquias %>% 
+  mutate(hospitales=replace_na(hospitales, 0))
+    
+```
+
+#### Parte 4: Cálculo del ratio de amenidades por habitante
+
+```{r, echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+#Cálculo del índice de amenidades por habitante
+parroquias <- parroquias %>% mutate(indicador=(hospitales/total_nacional)*1000)
+#Gráfica del indicador
+parroquias %>% 
+  ggplot()+
+  geom_sf(aes(fill=indicador))+
+  geom_sf(data=puntos)+
+  scale_fill_gradient(low = "#f5f5fa", high = "#211f5f")+
+  labs(title="Figura 3. Indicador de amenidades de salud por cada 1000 habitantes",
+       caption = "Fuente:INEC"
+       )
+
+
+```
+
+### Parte 5: Cálculo del índice de Moran para el Indicador de Amenidades de Salud
+
+#### Distribución
+
+```{r, echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+frec_plot <- parroquias %>% 
+  ggplot(aes(indicador)) +
+   geom_histogram(fill = "#14088b", color = "black") +
+  labs(title = "Fig 4. Distribución del número de amenidades por habitante",
+       sutitle = "Por zona censal")
+
+frec_plot
+```
+
+Se crea un histograma para visualizar la distribución del indicador. Esto nos da una idea de cómo están distribuidos estos valores en nuestra base de datos.
+
+```{r, echo=FALSE, message=FALSE}
+parroquias_ <- parroquias %>% 
+  st_drop_geometry()
+
+zonas <- left_join(zonas, parroquias_, by = "DPA_PARROQ")
+```
+
+```{r, echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+ggplot() +
+  geom_sf(data = zonas, aes(fill = indicador)) +
+  scale_fill_viridis_c(option = "D") +
+  scale_fill_gradient(low = "#f5f5fa", high = "#211f5f")+
+  labs(title = "Fig 5. Indicador de amenidades de salud por cada 1000 habitantes en Quito")
+```
+
+#### Matriz de Vecindad y Pesos Espaciales
+
+```{r, echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+vecinos <- poly2nb(zonas, queen = TRUE)
+  
+vecinos_pesos <- nb2listw(vecinos,style = "W")
+
+matriz <- listw2mat(vecinos_pesos)
+```
+
+#### Visualización de la Matriz de Pesos Espaciales
+
+```{r, echo=FALSE, message=FALSE}
+levelplot(t(matriz[1:50,1:50]),
+          scales = list(y = list(at = seq(10, 50, by = 10),
+                                 labels = seq(10, 50, by = 10))),
+          main = "Fig 6. Matriz de Pesos Espaciales Basada en Contigüidad")
+```
+
+Este gráfico muestra una porción de la matriz de pesos espaciales, visualizando cómo las zonas están conectadas entre sí.
+
+Calculamos el índice de Moran para evaluar la autocorrelación espacial
+
+```{r, echo=FALSE, message=FALSE}
+moran <- moran.test(zonas$indicador, listw = vecinos_pesos)
+```
+
+El resultado de la prueba de Moran $I$ es:
+
+```{r}
+moran
+```
+
+Dado que el valor p es menor que 0.05, rechazamos la hipótesis nula de no autocorrelación espacial. Concluimos que existe una autocorrelación espacial significativa en el Indicador de amenidades de salud por cada 1000 habitantes en Quito. Esto indica que las amenidades de salud están distribuidas de manera no aleatoria, con agrupamientos significativos en ciertas áreas. Las políticas de salud pública deben considerar esta distribución espacial para mejorar la efectividad de las intervenciones. Implementar estrategias focalizadas en las zonas con menor acceso a servicios de salud puede optimizar el uso de recursos y reducir desigualdades.
+
+#### Análisis de Autocorrelación Espacial con Matriz de Distancia Inversa
+
+En esta sección, se analiza cómo cambia el índice de Moran $I$ al aplicar una matriz de pesos espaciales basada en la distancia inversa, con una distancia máxima de 500 metros desde el centroide de cada zona censal.
+
+```{r, echo=FALSE, message=FALSE}
+# Calcular los centroides de las zonas
+centroids <- st_centroid(zonas)
+
+# Calcular las distancias entre los centroides de las zonas vecinas
+dists <- nbdists(vecinos, as.matrix(st_coordinates(centroids)))
+
+# Calcular los pesos inversos de las distancias
+ids <- map(dists, ~ 1/.x)
+```
+
+#### Crear una Matriz de Pesos Espaciales Basada en Distancia Inversa
+
+```{r, echo=FALSE, message=FALSE}
+# Crear una matriz de pesos espaciales basada en distancia inversa
+nbw_inv <- nb2listw(vecinos, glist = ids,style = "B",zero.policy = TRUE)
+
+head(nbw_inv)
+```
+
+#### Calcular el Índice de Moran $I$ con la Nueva Matriz de Pesos
+
+```{r, echo=FALSE, message=FALSE}
+moran_inversos <- moran.test(zonas$indicador, listw = nbw_inv)
+
+```
+
+El índice es:
+
+```{r}
+moran_inversos
+```
+
+### Parte 6: Actividad opcional, Análisis de Buffers y Reflexión sobre los Límites de OpenStreetMap
+
+#### Obtención del punto del lugar de trabajo
+
+```{r, echo=FALSE, message=FALSE}
+#Definir el punto de la Superintendencia de Bancos
+super<-tibble(lat=-0.2062, long=-78.4878) %>% 
+  st_as_sf(coords=c("long","lat"), crs=4326) %>% 
+  st_transform(32717)
+#Interseccion con la Superintendencia de Bancos
+inter<-st_intersects(super,zonas)
+#Indentificador de poligonos 
+zonas[unlist(inter), ] %>% 
+  pull(zon)
+```
+
+```{r,  echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+#Polígono que contiene a la Super
+zonas <- zonas %>% 
+  mutate(centro=if_else(zon=="170150191",
+                        true="Superintendencia de Bancos",
+                        false=NA_character_))
+#Mostrar en el mapa a la Superintendencia de Bancos
+mapa_super<-zonas %>% 
+  ggplot()+
+  geom_sf(aes(fill=centro))+
+  scale_fill_manual(values = c("Superintendencia de Bancos" = "#110a81", "#ecebfb"))+
+   labs(title="Figura 7. Superintendencia de Bancos"
+       )+
+  theme_minimal()
+mapa_super
+```
+
+#### Buffer de 500 m
+
+```{r,  echo=FALSE, message=FALSE}
+# Crear un objeto de ejemplo para la Superintendencia de Bancos
+zoom_to <- "170150191"
+super <- zonas %>% filter(zon == zoom_to)
+# Crear un buffer de 500 m alrededor del polígono de la Superintendencia de Bancos
+buffer <- st_buffer(super, dist = 500)
+class(buffer$Shape)
+```
+
+```{r,  echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+# Definir los límites del mapa para el zoom
+lon_bounds <- c(-78.505, -78.475)  
+lat_bounds <- c(-0.225, -0.195)
+# Transformar las coordenadas de las zonas para la visualización
+dmq_4326 <- st_transform(zonas, crs = 4326)
+# Mostrar el buffer en un mapa
+class(super$Shape)
+
+ggplot() +
+  geom_sf(data = dmq_4326, color = "#0f1973", size = 1) +
+  geom_sf(data = buffer, fill = "#e9ebfc", alpha = 0.5) +
+  theme_minimal() +
+  ggtitle("Fig 8.Buffer de 500 m alrededor del Polígono de la Superintendencia de Bancos") +
+  coord_sf(xlim = lon_bounds, ylim = lat_bounds)
+
+```
+
+```{r, echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+# Calcular el centroide del polígono de la Superintendencia
+centroid <- st_centroid(super)
+
+# Crear un buffer de 500 m alrededor del centroide
+buffer_centroid <- st_buffer(centroid, dist = 500)
+
+class(centroid$Shape)
+
+# Mostrar el buffer del centroide en un mapa
+ggplot() +
+  geom_sf(data = dmq_4326, color = "#1e1e6c", size = 1) +
+  geom_sf(data = buffer_centroid, fill = "#cacae3", alpha = 0.5) +
+  theme_minimal() +
+  ggtitle("Fig 9. Buffer de 500 m alrededor del Centroide de la Superintendencia de Bancos") +
+  coord_sf(xlim = lon_bounds, ylim = lat_bounds)
+```
+
+```{r, echo=FALSE, message=FALSE}
+# Crear buffers de 500 km alrededor de cada zona censal
+dmq_zonas_buffers <- st_buffer(st_centroid(zonas), dist = 500)
+
+# Identificar zonas con hospitales en el buffer
+zones_with_hospitals <- st_join(puntos, dmq_zonas_buffers, 
+                                join = st_within)
+```
+
+```{r, echo=FALSE, message=FALSE}
+amenidades <- zones_with_hospitals %>%
+  as_tibble() %>%
+  distinct(zon)
+
+zonas <- zonas %>%
+  mutate(
+    amenidad = case_when(
+      zon %in% amenidades$zon ~ "Hospitales",  
+      TRUE ~ "Ninguna"  
+    )
+  )
+
+```
+
+```{r, echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+zonas %>% 
+ggplot() +
+  geom_sf(aes(fill = amenidad)) +
+   scale_fill_manual(values = c("Hospitales" = "#08086f"), na.value = "#eeeefb") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(title = "Fig 10. Zonas censales con  hospitales", fill = "Amenidad")
+```
+
+```{r, echo=FALSE, message=FALSE, fig.height=6, fig.dpi=300}
+# Mostrar el mapa con zoom sobre la Superintendencia de Bancos
+dmq <- st_transform(zonas, crs = 4326)
+buffer_super_2 <- st_buffer(st_centroid(super),dist = 500)
+ggplot(dmq) +
+  geom_sf(aes(fill = amenidad)) +
+    scale_fill_manual(values = c("Hospitales" = "#f1f1fd", "Ninguna" = "#15156a")) +
+  geom_sf(data = buffer_super_2, fill = "#f3f6dc", alpha = 0.5) +
+  coord_sf(xlim = lon_bounds, ylim = lat_bounds) +
+  theme_minimal() +
+  ggtitle("Fig 11.Zoom sobre la Superintendencia de Bancos y su Amenidad")
+```
+
+![](images/Screenshot_2.jpg){fig-alt="Fig 12. Superintendencia de Bancos (Google Maps)" fig-align="center"}
+
+Como se puede observar, alrededor de la Superintendencia de Bancos existen varios hospitales. Sin embargo, los límites utilizados en la Figura 11, basada en OpenStreetMap, puede no coincidir exactamente con las ubicaciones o distancias visualizadas en otras plataformas como Google Maps. Esto puede llevar a diferencias en la percepción espacial de las amenidades y su relación con la Superintendencia de Bancos.
